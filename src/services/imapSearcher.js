@@ -51,6 +51,17 @@ export function getImapSettings(email, customHost, customPort) {
     return { host: 'imap.mail.yahoo.com', port: 993, secure: true };
   }
 
+  // GMX (de, net, at, ch, com)
+  if (
+    domain === 'gmx.de' ||
+    domain === 'gmx.net' ||
+    domain === 'gmx.at' ||
+    domain === 'gmx.ch' ||
+    domain === 'gmx.com'
+  ) {
+    return { host: 'imap.gmx.net', port: 993, secure: true };
+  }
+
   // Fallback to standard guess
   return { host: `imap.${domain}`, port: 993, secure: true };
 }
