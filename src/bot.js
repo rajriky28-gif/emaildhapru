@@ -244,11 +244,15 @@ async function executeSearch(ctx, sender, keyword) {
 
 bot.start((ctx) => {
   const welcomeText = `👋 *Welcome to the Cloud-Hosted Email Searcher Bot!*\n\n` +
-                      `I manage your company's email pool and search across multiple accounts for a sender and keyword.\n\n` +
-                      `⚙️ *How to setup:*\n` +
-                      `1. Upload a \`.csv\` or \`.txt\` file containing your email credentials.\n` +
-                      `2. The file can be a CSV with headers (\`email\` and \`password\`) or a text file with one \`email,password\` (or \`email:password\`) per line.\n` +
-                      `   *(Optional columns: \`imap_host\`, \`imap_port\`)*`;
+                      `Please upload your credentials list to begin. I support both \`.csv\` and \`.txt\` files.\n\n` +
+                      `📋 *File Format & Ordering:* (one account per line)\n` +
+                      `\`\`\`\n` +
+                      `email,password\n` +
+                      `user1@gmail.com,your-app-password-1\n` +
+                      `user2@outlook.com,your-app-password-2\n` +
+                      `\`\`\`\n` +
+                      `*(Note: The email must come first, followed by the password, separated by a comma, colon, or tab)*\n\n` +
+                      `💡 *Important:* Gmail/Outlook/Yahoo/MSN require *App Passwords* (2-Step Verification must be enabled on the account).`;
   sendMainMenu(ctx, welcomeText);
 });
 
@@ -500,12 +504,26 @@ bot.on(message('document'), async (ctx) => {
 
     const savedCount = await saveEmails(emailsList);
     
+    const successMsg = `✅ *Success!*\n` +
+                       `Loaded and encrypted *${savedCount}* email accounts into MongoDB.\n\n` +
+                       `What would you like to do next?`;
+
+    const optionsMenu = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('🔍 Search Emails', 'btn_search_init'),
+        Markup.button.callback('🧹 Clear Database', 'btn_clear_confirm')
+      ],
+      [
+        Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')
+      ]
+    ]);
+
     ctx.telegram.editMessageText(
       ctx.chat.id,
       processingMsg.message_id,
       null,
-      `✅ *Success!*\nLoaded and encrypted *${savedCount}* email accounts into MongoDB.`,
-      Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]])
+      successMsg,
+      { parse_mode: 'Markdown', ...optionsMenu }
     );
   } catch (err) {
     ctx.telegram.editMessageText(
@@ -543,7 +561,8 @@ bot.on(message('text'), async (ctx) => {
 
     const msg = `🔍 *Email Search (Step 2 of 2)*\n\n` +
                 `• Sender: \`${state.sender}\`\n\n` +
-                `Please reply with the **Keyword** to search inside email subject or body (or click the button below to search all emails from this sender):`;
+                `*(Optional)* Enter the **Keyword** to search inside email subject or body:\n` +
+                `_(If you do not want a keyword, click the skip button below to search all emails from this sender)_`;
                 
     const menu = Markup.inlineKeyboard([
       [Markup.button.callback('⏭️ Skip Keyword (Search All)', 'skip_keyword')],
