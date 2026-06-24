@@ -28,14 +28,16 @@ export function getImapSettings(email, customHost, customPort) {
     return { host: 'imap.gmail.com', port: 993, secure: true };
   }
 
-  // Outlook, Hotmail, Live
+  // Outlook, Hotmail, Live, MSN (and regional/localized domains)
   if (
     domain === 'outlook.com' ||
     domain === 'hotmail.com' ||
     domain === 'live.com' ||
-    domain === 'live.co.uk' ||
-    domain.endsWith('.outlook.com') ||
-    domain.endsWith('.hotmail.com')
+    domain === 'msn.com' ||
+    domain.includes('outlook.') ||
+    domain.includes('hotmail.') ||
+    domain.includes('live.') ||
+    domain.includes('msn.')
   ) {
     return { host: 'outlook.office365.com', port: 993, secure: true };
   }
