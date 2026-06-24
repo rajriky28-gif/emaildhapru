@@ -231,7 +231,10 @@ async function executeSearch(ctx, sender, keyword) {
     await ctx.replyWithDocument(
       { source: Buffer.from(csvContent, 'utf8'), filename: filename },
       { caption: `📂 Full report for search: Sender: "${sender}", Keyword: "${keyword || 'None'}"` }
-    );
+    ).catch(err => {
+      console.error('Failed to send CSV document:', err.message);
+      ctx.reply('⚠️ *Note:* Search completed, but a temporary Telegram network issue occurred while uploading the detailed spreadsheet report. You can review the summary above.');
+    });
 
   } catch (err) {
     ctx.reply(`❌ An error occurred during search: ${err.message}`, Markup.inlineKeyboard([
