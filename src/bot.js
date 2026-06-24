@@ -549,8 +549,66 @@ bot.on(message('text'), async (ctx) => {
   const state = userStates.get(ctx.chat.id);
 
   if (!state) {
-    // If no active state, redirect them to the Main Menu
-    return sendMainMenu(ctx, `💡 _Please use the buttons below to interact with the bot._`);
+    // Check if the text looks like raw credentials (e.g. user@gmail.com,password)
+    const lines = text.split(/\r?\n/);
+    const seenEmails = new Set();
+    const emailsList = lines.map(line => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.toLowerCase().startsWith('email')) return null;
+
+      // Split by comma, tab, pipe, or colon
+      const parts = trimmed.split(/[,\t|:]/);
+      if (parts.length < 2) return null;
+
+      const email = parts[0].trim().toLowerCase();
+      const password = parts[1].trim();
+
+      if (!email.includes('@')) return null;
+      if (seenEmails.has(email)) return null; // skip duplicates
+      seenEmails.add(email);
+
+      return {
+        email,
+        password,
+        imapHost: parts[2] ? parts[2].trim() : undefined,
+        imapPort: parts[3] ? parseInt(parts[3].trim(), 10) : undefined
+      };
+    }).filter(Boolean);
+
+    if (emailsList.length > 0) {
+      // It is raw credentials! Process and save them.
+      const processingMsg = await ctx.reply('⏳ Parsing and storing credentials from text...');
+      try {
+        const savedCount = await saveEmails(emailsList);
+        
+        const successMsg = `✅ *Success!*\n` +
+                           `Loaded and encrypted *${savedCount}* email accounts from text into MongoDB.\n\n` +
+                           `What would you like to do next?`;
+
+        const optionsMenu = Markup.inlineKeyboard([
+          [
+            Markup.button.callback('🔍 Search Emails', 'btn_search_init'),
+            Markup.button.callback('🧹 Clear Database', 'btn_clear_confirm')
+          ],
+          [
+            Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')
+          ]
+        ]);
+
+        return ctx.telegram.editMessageText(
+          ctx.chat.id,
+          processingMsg.message_id,
+          null,
+          successMsg,
+          { parse_mode: 'Markdown', ...optionsMenu }
+        ).catch(() => ctx.replyWithMarkdown(successMsg, optionsMenu));
+      } catch (err) {
+        return ctx.reply(`❌ Failed to store credentials: ${err.message}`, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]]));
+      }
+    }
+
+    // If not credentials, redirect them to the Main Menu
+    return sendMainMenu(ctx, `💡 _Please use the buttons below to interact with the bot, or upload/paste a credentials list._`);
   }
 
   if (state.step === 'awaiting_sender') {
