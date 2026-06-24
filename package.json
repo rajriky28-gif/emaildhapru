@@ -1,0 +1,21 @@
+{
+  "name": "telegram-email-search-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot to search emails across multiple IMAP mailboxes",
+  "type": "module",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js",
+    "test-imap": "node src/test_imap.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "imapflow": "^1.0.158",
+    "dotenv": "^16.4.5",
+    "csv-parse": "^5.5.6",
+    "p-limit": "^5.0.0",
+    "socks-proxy-agent": "^8.0.3",
+    "https-proxy-agent": "^7.0.4",
+    "mongodb": "^6.5.0"
+  }
+}
