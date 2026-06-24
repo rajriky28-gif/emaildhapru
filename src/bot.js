@@ -401,6 +401,12 @@ bot.on(message('document'), async (ctx) => {
     return ctx.reply('⚠️ Please upload a valid CSV (.csv) or text (.txt) file.');
   }
 
+  // File size limit check (5MB)
+  const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
+  if (document.file_size && document.file_size > MAX_FILE_SIZE_BYTES) {
+    return ctx.reply(`⚠️ The uploaded file is too large (${(document.file_size / 1024 / 1024).toFixed(2)} MB). Please upload a credentials list smaller than 5MB.`);
+  }
+
   const processingMsg = await ctx.reply('⏳ Downloading and parsing file...');
 
   try {
