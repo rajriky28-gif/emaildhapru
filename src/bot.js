@@ -1,4 +1,4 @@
-import { Telegraf } from 'telegraf';
+import { Telegraf, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import dotenv from 'dotenv';
 import { parse } from 'csv-parse/sync';
@@ -35,6 +35,9 @@ server.listen(pingPort, '0.0.0.0', () => {
   console.log(`📡 Keep-Alive server is listening on port ${pingPort}`);
 });
 
+// State Machine for Search Wizard
+const userStates = new Map(); // Key: chatId, Value: { step: string, sender?: string }
+
 // Helper: Parse arguments, preserving quoted strings
 function parseArguments(text) {
   const regex = /[^\s"]+|"([^"]*)"/gi;
@@ -66,44 +69,194 @@ async function loadProxies() {
   }
 }
 
+// Helper: Render Main Menu
+function sendMainMenu(ctx, welcomeText = '') {
+  const msg = (welcomeText ? welcomeText + '\n\n' : '') +
+              `🤖 *Main Menu*\n\n` +
+              `Please choose an option below to manage credentials or start searching:`;
+              
+  const menu = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('📊 Bot Status', 'btn_status'),
+      Markup.button.callback('🔍 Search Emails', 'btn_search_init')
+    ],
+    [
+      Markup.button.callback('🧹 Clear Database', 'btn_clear_confirm'),
+      Markup.button.callback('❓ Help Guide', 'btn_help')
+    ]
+  ]);
+
+  if (ctx.callbackQuery) {
+    ctx.editMessageText(msg, { parse_mode: 'Markdown', ...menu }).catch(() => {
+      ctx.replyWithMarkdown(msg, menu);
+    });
+  } else {
+    ctx.replyWithMarkdown(msg, menu);
+  }
+}
+
+// Helper: Execute Mailbox Search
+async function executeSearch(ctx, sender, keyword) {
+  const chatId = ctx.chat.id;
+  
+  try {
+    const accounts = await getDecryptedEmails();
+    if (accounts.length === 0) {
+      const msg = '⚠️ No email accounts loaded. Please upload a CSV/TXT file with credentials first.';
+      const backBtn = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]]);
+      
+      if (ctx.callbackQuery) {
+        return ctx.editMessageText(msg, backBtn).catch(() => ctx.reply(msg, backBtn));
+      } else {
+        return ctx.reply(msg, backBtn);
+      }
+    }
+
+    const proxies = await loadProxies();
+    
+    const startText = `🔍 *Search Started...*\n\n` +
+                      `• Sender: \`${sender}\`\n` +
+                      `• Keyword: \`${keyword || '(none)'}\`\n` +
+                      `• Accounts to check: *${accounts.length}*\n\n` +
+                      `Initializing connections...`;
+
+    let progressMsg;
+    if (ctx.callbackQuery) {
+      progressMsg = await ctx.editMessageText(startText, { parse_mode: 'Markdown' })
+        .catch(() => ctx.replyWithMarkdown(startText));
+    } else {
+      progressMsg = await ctx.replyWithMarkdown(startText);
+    }
+    
+    const messageId = progressMsg.message_id;
+    let lastEditTime = 0;
+    const EDIT_THROTTLE_MS = 2000;
+
+    const onProgress = (completed, total, results) => {
+      const now = Date.now();
+      const isFinal = completed === total;
+      
+      if (!isFinal && now - lastEditTime < EDIT_THROTTLE_MS) {
+        return;
+      }
+      lastEditTime = now;
+
+      const successful = results.filter(r => r.success);
+      const totalMatches = successful.reduce((sum, r) => sum + r.count, 0);
+      const failed = results.filter(r => !r.success).length;
+
+      const barLength = 10;
+      const filledLength = Math.round((completed / total) * barLength);
+      const emptyLength = barLength - filledLength;
+      const bar = '█'.repeat(filledLength) + '░'.repeat(emptyLength);
+      const percent = Math.round((completed / total) * 100);
+
+      const text = `🔍 *Searching Email Accounts...*\n\n` +
+                   `• Sender: \`${sender}\`\n` +
+                   `• Keyword: \`${keyword || '(none)'}\`\n\n` +
+                   `Progress: \`[${bar}]\` ${percent}% (${completed}/${total})\n` +
+                   `📈 Matches found so far: *${totalMatches}*\n` +
+                   `⚠️ Failed connections: *${failed}*\n\n` +
+                   `_Please wait, checking mailboxes concurrently..._`;
+
+      ctx.telegram.editMessageText(chatId, messageId, null, text, { parse_mode: 'Markdown' })
+         .catch(() => {});
+    };
+
+    const results = await searchAllMailboxes(accounts, sender, keyword, proxies, onProgress);
+
+    const successful = results.filter(r => r.success);
+    const totalMatches = successful.reduce((sum, r) => sum + r.count, 0);
+    const failed = results.filter(r => !r.success);
+
+    let reportMsg = `✅ *Search Completed!*\n\n` +
+                    `📋 *Summary:*\n` +
+                    `• Mailboxes Checked: *${results.length}*\n` +
+                    `• Total Matches Found: *${totalMatches}*\n` +
+                    `• Failed Connections: *${failed.length}*\n\n`;
+
+    const matchesDetails = successful.filter(r => r.count > 0);
+    if (matchesDetails.length > 0) {
+      reportMsg += `*Hits by Account:*\n`;
+      matchesDetails.slice(0, 20).forEach(r => {
+        reportMsg += `• \`${r.email}\`: *${r.count}* matches\n`;
+      });
+      if (matchesDetails.length > 20) {
+        reportMsg += `• _...and ${matchesDetails.length - 20} more (see full CSV)_`;
+      }
+      reportMsg += `\n`;
+    }
+
+    if (failed.length > 0) {
+      reportMsg += `*Failed Mailboxes (first 10 shown):*\n`;
+      failed.slice(0, 10).forEach(r => {
+        reportMsg += `• \`${r.email}\`: _${r.error}_\n`;
+      });
+      if (failed.length > 10) {
+        reportMsg += `• _...and ${failed.length - 10} more errors_`;
+      }
+    }
+
+    // Delete progress message and send report
+    await ctx.telegram.deleteMessage(chatId, messageId).catch(() => {});
+    
+    const backBtn = Markup.inlineKeyboard([
+      [Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]
+    ]);
+    await ctx.replyWithMarkdown(reportMsg, backBtn);
+
+    // Send complete detailed CSV report to user
+    const csvHeader = 'Email,Status,Matches,Error\n';
+    const csvRows = results.map(r => {
+      const escapedEmail = r.email.replace(/"/g, '""');
+      if (r.success) {
+        return `"${escapedEmail}",Success,${r.count},`;
+      } else {
+        const escapedError = r.error.replace(/"/g, '""');
+        return `"${escapedEmail}",Failed,0,"${escapedError}"`;
+      }
+    }).join('\n');
+
+    const csvContent = csvHeader + csvRows;
+    const filename = `search_results_${Date.now()}.csv`;
+
+    await ctx.replyWithDocument(
+      { source: Buffer.from(csvContent, 'utf8'), filename: filename },
+      { caption: `📂 Full report for search: Sender: "${sender}", Keyword: "${keyword || 'None'}"` }
+    );
+
+  } catch (err) {
+    ctx.reply(`❌ An error occurred during search: ${err.message}`, Markup.inlineKeyboard([
+      [Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]
+    ]));
+  }
+}
+
 // --- Bot Commands ---
 
-// /start
 bot.start((ctx) => {
-  const msg = `👋 *Welcome to the Cloud-Hosted Email Searcher Bot!*\n\n` +
-              `I manage your company's email pool and search across multiple accounts for a sender and keyword.\n\n` +
-              `⚙️ *How to setup:*\n` +
-              `1. Upload a \`.csv\` or \`.txt\` file containing your email credentials.\n` +
-              `2. The file can be a CSV with headers (\`email\` and \`password\`) or a text file with one \`email,password\` (or \`email:password\`) per line.\n` +
-              `   *(Optional columns: \`imap_host\`, \`imap_port\`)*\n\n` +
-              `🔍 *Commands:*\n` +
-              `• \`/search <sender> [keyword]\` - Search across all accounts\n` +
-              `  _Example:_ \`/search paypal.com invoice\`\n` +
-              `  _Example with spaces:_ \`/search "John Doe" "refund process"\`\n` +
-              `• \`/status\` - View currently loaded email count\n` +
-              `• \`/clear\` - Remove all loaded email accounts from the database\n\n` +
-              `🔒 *Security Note:* Your passwords are encrypted using AES-256 before storing them in MongoDB Atlas.`;
-  ctx.replyWithMarkdown(msg);
+  const welcomeText = `👋 *Welcome to the Cloud-Hosted Email Searcher Bot!*\n\n` +
+                      `I manage your company's email pool and search across multiple accounts for a sender and keyword.\n\n` +
+                      `⚙️ *How to setup:*\n` +
+                      `1. Upload a \`.csv\` or \`.txt\` file containing your email credentials.\n` +
+                      `2. The file can be a CSV with headers (\`email\` and \`password\`) or a text file with one \`email,password\` (or \`email:password\`) per line.\n` +
+                      `   *(Optional columns: \`imap_host\`, \`imap_port\`)*`;
+  sendMainMenu(ctx, welcomeText);
 });
 
-bot.help((ctx) => ctx.replyWithMarkdown(`🔍 *Commands:*\n• \`/search <sender> [keyword]\`\n• \`/status\`\n• \`/clear\`\n\nUpload a \`.csv\` or \`.txt\` file to update your credentials pool.`));
+bot.help((ctx) => {
+  sendMainMenu(ctx, `❓ *Need help?* Use the menu buttons below to interact with the bot, or upload a new credentials file.`);
+});
 
 // /status
 bot.command('status', async (ctx) => {
   try {
     const count = await getEmailCount();
     const proxies = await loadProxies();
-    
     let msg = `📊 *Bot Status:*\n` +
               `• Loaded Email Accounts: *${count}*\n` +
-              `• Configured Proxies: *${proxies.length}*\n\n`;
-              
-    if (count === 0) {
-      msg += `💡 _No emails loaded. Please upload a .csv or .txt file to store credentials in MongoDB._`;
-    } else {
-      msg += `Ready to run searches! Use \`/search <sender> [keyword]\``;
-    }
-    ctx.replyWithMarkdown(msg);
+              `• Configured Proxies: *${proxies.length}*`;
+    ctx.replyWithMarkdown(msg, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]]));
   } catch (err) {
     ctx.reply(`❌ Error getting status: ${err.message}`);
   }
@@ -113,10 +266,129 @@ bot.command('status', async (ctx) => {
 bot.command('clear', async (ctx) => {
   try {
     await saveEmails([]);
-    ctx.reply('🧹 Credentials database cleared successfully.');
+    ctx.reply('🧹 Credentials database cleared successfully.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]]));
   } catch (err) {
     ctx.reply(`❌ Error clearing database: ${err.message}`);
   }
+});
+
+// /search
+bot.command('search', async (ctx) => {
+  const args = parseArguments(ctx.message.text);
+  if (args.length === 0) {
+    return ctx.replyWithMarkdown(
+      `⚠️ *Usage:* \`/search <sender> [keyword]\`\n` +
+      `_Examples:_\n` +
+      `• \`/search paypal.com\`\n` +
+      `• \`/search stripe.com invoice\`\n\n` +
+      `💡 _Or simply click "Search Emails" in the main menu to use the guided wizard!_`
+    );
+  }
+  const sender = args[0];
+  const keyword = args[1] || '';
+  await executeSearch(ctx, sender, keyword);
+});
+
+// --- Callback Actions (Buttons) ---
+
+bot.action('btn_menu', (ctx) => {
+  userStates.delete(ctx.chat.id); // Reset state
+  sendMainMenu(ctx);
+});
+
+bot.action('btn_status', async (ctx) => {
+  try {
+    const count = await getEmailCount();
+    const proxies = await loadProxies();
+    
+    let msg = `📊 *Bot Status:*\n\n` +
+              `• Loaded Email Accounts: *${count}*\n` +
+              `• Configured Proxies: *${proxies.length}*\n\n`;
+              
+    if (count === 0) {
+      msg += `💡 _No emails loaded. Please upload a .csv or .txt file to store credentials in MongoDB._`;
+    } else {
+      msg += `Ready to run searches! Click "Search Emails" below or use the /search command.`;
+    }
+
+    const menu = Markup.inlineKeyboard([
+      [Markup.button.callback('🔍 Search Emails', 'btn_search_init')],
+      [Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]
+    ]);
+
+    ctx.editMessageText(msg, { parse_mode: 'Markdown', ...menu }).catch(() => {});
+  } catch (err) {
+    ctx.reply(`❌ Error: ${err.message}`, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]]));
+  }
+});
+
+bot.action('btn_search_init', async (ctx) => {
+  try {
+    const count = await getEmailCount();
+    if (count === 0) {
+      const msg = `⚠️ *No Accounts Loaded*\n\nPlease upload a \`.csv\` or \`.txt\` credentials file first to store email credentials in MongoDB.`;
+      const menu = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]]);
+      return ctx.editMessageText(msg, { parse_mode: 'Markdown', ...menu }).catch(() => {});
+    }
+
+    // Initialize state
+    userStates.set(ctx.chat.id, { step: 'awaiting_sender' });
+
+    const msg = `🔍 *Email Search (Step 1 of 2)*\n\n` +
+                `Please reply to this message with the **Sender email address or domain** you want to search (e.g. \`paypal.com\` or \`stripe.com\`):`;
+                
+    const menu = Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel Search', 'btn_menu')]]);
+    ctx.editMessageText(msg, { parse_mode: 'Markdown', ...menu }).catch(() => ctx.replyWithMarkdown(msg, menu));
+  } catch (err) {
+    ctx.reply(`❌ Error: ${err.message}`);
+  }
+});
+
+bot.action('btn_clear_confirm', (ctx) => {
+  const msg = `⚠️ *Are you sure you want to delete all credentials?*\n\n` +
+              `This will wipe all email logins from your MongoDB database. This action cannot be undone.`;
+              
+  const menu = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('🗑️ Yes, Clear Everything', 'btn_clear_yes'),
+      Markup.button.callback('❌ No, Cancel', 'btn_menu')
+    ]
+  ]);
+  ctx.editMessageText(msg, { parse_mode: 'Markdown', ...menu }).catch(() => {});
+});
+
+bot.action('btn_clear_yes', async (ctx) => {
+  try {
+    await saveEmails([]);
+    const msg = `🧹 *Database Cleared Successfully!*\nAll credentials have been deleted.`;
+    const menu = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]]);
+    ctx.editMessageText(msg, { parse_mode: 'Markdown', ...menu }).catch(() => {});
+  } catch (err) {
+    ctx.reply(`❌ Error clearing database: ${err.message}`, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]]));
+  }
+});
+
+bot.action('btn_help', (ctx) => {
+  const msg = `❓ *Help Guide & Instructions*\n\n` +
+              `• *Uploading Emails:* Upload a \`.csv\` or \`.txt\` file containing your accounts. Columns should be \`email\` and \`password\`.\n\n` +
+              `• *App Passwords:* Ensure your accounts (Gmail/Outlook/Yahoo) have 2FA enabled and you use an *App Password* rather than your normal password.\n\n` +
+              `• *Proxy Rotation:* Place SOCKS5/HTTP proxies in \`proxies.txt\` inside the root folder to route connections and prevent IP rate-limiting.\n\n` +
+              `• *Search Options:* Search by sender address, and optionally filter by keyword in subject/body. Results are displayed as a summary and a detailed CSV report file.`;
+
+  const menu = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]]);
+  ctx.editMessageText(msg, { parse_mode: 'Markdown', ...menu }).catch(() => {});
+});
+
+bot.action('skip_keyword', async (ctx) => {
+  const state = userStates.get(ctx.chat.id);
+  if (!state || state.step !== 'awaiting_keyword') {
+    userStates.delete(ctx.chat.id);
+    return sendMainMenu(ctx);
+  }
+
+  const sender = state.sender;
+  userStates.delete(ctx.chat.id); // Clear state
+  await executeSearch(ctx, sender, '');
 });
 
 // File Upload Handler (CSV & TXT)
@@ -171,7 +443,7 @@ bot.on(message('document'), async (ctx) => {
       // Ignore CSV parser errors to allow raw line-by-line fallback
     }
 
-    // 2. Fallback Line-by-Line Parsing (if CSV parsing yielded 0 valid accounts)
+    // 2. Fallback Line-by-Line Parsing (if CSV parsing yielded 0 valid records)
     if (emailsList.length === 0) {
       const lines = fileText.split(/\r?\n/);
       emailsList = lines.map(line => {
@@ -207,144 +479,60 @@ bot.on(message('document'), async (ctx) => {
       ctx.chat.id,
       processingMsg.message_id,
       null,
-      `✅ *Success!*\nLoaded and encrypted *${savedCount}* email accounts into MongoDB.\n\nUse \`/status\` to check or \`/search\` to begin querying.`
+      `✅ *Success!*\nLoaded and encrypted *${savedCount}* email accounts into MongoDB.`,
+      Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]])
     );
   } catch (err) {
     ctx.telegram.editMessageText(
       ctx.chat.id,
       processingMsg.message_id,
       null,
-      `❌ *Upload Failed:*\n${err.message}`
+      `❌ *Upload Failed:*\n${err.message}`,
+      Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'btn_menu')]])
     );
   }
 });
 
-// /search <sender> [keyword]
-bot.command('search', async (ctx) => {
-  const args = parseArguments(ctx.message.text);
+// --- Text Messages Handler (Wizard Flow Routing) ---
+
+bot.on(message('text'), async (ctx) => {
+  const text = ctx.message.text.trim();
   
-  if (args.length === 0) {
-    return ctx.replyWithMarkdown(
-      `⚠️ *Usage:* \`/search <sender> [keyword]\`\n` +
-      `_Examples:_\n` +
-      `• \`/search paypal.com\`\n` +
-      `• \`/search stripe.com invoice\`\n` +
-      `• \`/search "John Doe" "chargeback alert"\``
-    );
+  // Skip command messages (they are handled by specific bot.command handlers)
+  if (text.startsWith('/')) {
+    return;
   }
 
-  const sender = args[0];
-  const keyword = args[1] || '';
+  const state = userStates.get(ctx.chat.id);
 
-  try {
-    const accounts = await getDecryptedEmails();
-    if (accounts.length === 0) {
-      return ctx.reply('⚠️ No email accounts loaded. Please upload a CSV file with credentials first.');
-    }
+  if (!state) {
+    // If no active state, redirect them to the Main Menu
+    return sendMainMenu(ctx, `💡 _Please use the buttons below to interact with the bot._`);
+  }
 
-    const proxies = await loadProxies();
-    
-    const progressMsg = await ctx.replyWithMarkdown(
-      `🔍 *Search Started...*\n\n` +
-      `• Sender: \`${sender}\`\n` +
-      `• Keyword: \`${keyword || '(none)'}\`\n` +
-      `• Accounts to check: *${accounts.length}*\n\n` +
-      `Initializing connections...`
-    );
+  if (state.step === 'awaiting_sender') {
+    // Save sender and update state
+    state.sender = text;
+    state.step = 'awaiting_keyword';
+    userStates.set(ctx.chat.id, state);
 
-    let lastEditTime = 0;
-    const EDIT_THROTTLE_MS = 2000;
+    const msg = `🔍 *Email Search (Step 2 of 2)*\n\n` +
+                `• Sender: \`${state.sender}\`\n\n` +
+                `Please reply with the **Keyword** to search inside email subject or body (or click the button below to search all emails from this sender):`;
+                
+    const menu = Markup.inlineKeyboard([
+      [Markup.button.callback('⏭️ Skip Keyword (Search All)', 'skip_keyword')],
+      [Markup.button.callback('❌ Cancel Search', 'btn_menu')]
+    ]);
 
-    const onProgress = (completed, total, results) => {
-      const now = Date.now();
-      const isFinal = completed === total;
-      
-      if (!isFinal && now - lastEditTime < EDIT_THROTTLE_MS) {
-        return;
-      }
-      lastEditTime = now;
+    return ctx.replyWithMarkdown(msg, menu);
+  }
 
-      const successful = results.filter(r => r.success);
-      const totalMatches = successful.reduce((sum, r) => sum + r.count, 0);
-      const failed = results.filter(r => !r.success).length;
-
-      const barLength = 10;
-      const filledLength = Math.round((completed / total) * barLength);
-      const emptyLength = barLength - filledLength;
-      const bar = '█'.repeat(filledLength) + '░'.repeat(emptyLength);
-      const percent = Math.round((completed / total) * 100);
-
-      const text = `🔍 *Searching Email Accounts...*\n\n` +
-                   `• Sender: \`${sender}\`\n` +
-                   `• Keyword: \`${keyword || '(none)'}\`\n\n` +
-                   `Progress: \`[${bar}]\` ${percent}% (${completed}/${total})\n` +
-                   `📈 Matches found so far: *${totalMatches}*\n` +
-                   `⚠️ Failed connections: *${failed}*\n\n` +
-                   `_Please wait, checking mailboxes concurrently..._`;
-
-      ctx.telegram.editMessageText(ctx.chat.id, progressMsg.message_id, null, text, { parse_mode: 'Markdown' })
-         .catch(() => {});
-    };
-
-    const results = await searchAllMailboxes(accounts, sender, keyword, proxies, onProgress);
-
-    const successful = results.filter(r => r.success);
-    const totalMatches = successful.reduce((sum, r) => sum + r.count, 0);
-    const failed = results.filter(r => !r.success);
-
-    let reportMsg = `✅ *Search Completed!*\n\n` +
-                    `📋 *Summary:*\n` +
-                    `• Mailboxes Checked: *${results.length}*\n` +
-                    `• Total Matches Found: *${totalMatches}*\n` +
-                    `• Failed Connections: *${failed.length}*\n\n`;
-
-    const matchesDetails = successful.filter(r => r.count > 0);
-    if (matchesDetails.length > 0) {
-      reportMsg += `*Hits by Account:*\n`;
-      matchesDetails.slice(0, 20).forEach(r => {
-        reportMsg += `• \`${r.email}\`: *${r.count}* matches\n`;
-      });
-      if (matchesDetails.length > 20) {
-        reportMsg += `• _...and ${matchesDetails.length - 20} more (see full CSV)_`;
-      }
-      reportMsg += `\n`;
-    }
-
-    if (failed.length > 0) {
-      reportMsg += `*Failed Mailboxes (first 10 shown):*\n`;
-      failed.slice(0, 10).forEach(r => {
-        reportMsg += `• \`${r.email}\`: _${r.error}_\n`;
-      });
-      if (failed.length > 10) {
-        reportMsg += `• _...and ${failed.length - 10} more errors_`;
-      }
-    }
-
-    await ctx.telegram.deleteMessage(ctx.chat.id, progressMsg.message_id).catch(() => {});
-    await ctx.replyWithMarkdown(reportMsg);
-
-    // Send complete detailed CSV report to user
-    const csvHeader = 'Email,Status,Matches,Error\n';
-    const csvRows = results.map(r => {
-      const escapedEmail = r.email.replace(/"/g, '""');
-      if (r.success) {
-        return `"${escapedEmail}",Success,${r.count},`;
-      } else {
-        const escapedError = r.error.replace(/"/g, '""');
-        return `"${escapedEmail}",Failed,0,"${escapedError}"`;
-      }
-    }).join('\n');
-
-    const csvContent = csvHeader + csvRows;
-    const filename = `search_results_${Date.now()}.csv`;
-
-    await ctx.replyWithDocument(
-      { source: Buffer.from(csvContent, 'utf8'), filename: filename },
-      { caption: `📂 Full report for search: Sender: "${sender}", Keyword: "${keyword || 'None'}"` }
-    );
-
-  } catch (err) {
-    ctx.reply(`❌ An error occurred during search: ${err.message}`);
+  if (state.step === 'awaiting_keyword') {
+    // Execute search and clear state
+    const sender = state.sender;
+    userStates.delete(ctx.chat.id); // Reset state
+    await executeSearch(ctx, sender, text);
   }
 });
 
