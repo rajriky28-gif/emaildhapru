@@ -8,6 +8,9 @@
     "start": "node src/bot.js",
     "test-imap": "node src/test_imap.js"
   },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "telegraf": "^4.16.3",
     "imapflow": "^1.0.158",

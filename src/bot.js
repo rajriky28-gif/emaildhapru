@@ -7,6 +7,14 @@ import http from 'http';
 import { initStore, closeStore, saveEmails, getDecryptedEmails, getEmailCount } from './services/emailStore.js';
 import { searchAllMailboxes } from './services/imapSearcher.js';
 
+// Global Exception Handlers to prevent crashes from network issues
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('⚠️ Unhandled Rejection at:', promise, 'reason:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ Uncaught Exception thrown:', err);
+});
+
 dotenv.config();
 
 // 1. Initialize Configuration
