@@ -73,8 +73,8 @@ bot.start((ctx) => {
   const msg = `👋 *Welcome to the Cloud-Hosted Email Searcher Bot!*\n\n` +
               `I manage your company's email pool and search across multiple accounts for a sender and keyword.\n\n` +
               `⚙️ *How to setup:*\n` +
-              `1. Upload a \`.csv\` file containing your email credentials.\n` +
-              `2. The CSV should have headers: \`email\` and \`password\`.\n` +
+              `1. Upload a \`.csv\` or \`.txt\` file containing your email credentials.\n` +
+              `2. The file can be a CSV with headers (\`email\` and \`password\`) or a text file with one \`email,password\` (or \`email:password\`) per line.\n` +
               `   *(Optional columns: \`imap_host\`, \`imap_port\`)*\n\n` +
               `🔍 *Commands:*\n` +
               `• \`/search <sender> [keyword]\` - Search across all accounts\n` +
@@ -86,7 +86,7 @@ bot.start((ctx) => {
   ctx.replyWithMarkdown(msg);
 });
 
-bot.help((ctx) => ctx.replyWithMarkdown(`🔍 *Commands:*\n• \`/search <sender> [keyword]\`\n• \`/status\`\n• \`/clear\`\n\nUpload a \`.csv\` file to update your credentials pool.`));
+bot.help((ctx) => ctx.replyWithMarkdown(`🔍 *Commands:*\n• \`/search <sender> [keyword]\`\n• \`/status\`\n• \`/clear\`\n\nUpload a \`.csv\` or \`.txt\` file to update your credentials pool.`));
 
 // /status
 bot.command('status', async (ctx) => {
@@ -99,7 +99,7 @@ bot.command('status', async (ctx) => {
               `• Configured Proxies: *${proxies.length}*\n\n`;
               
     if (count === 0) {
-      msg += `💡 _No emails loaded. Please upload a .csv file to store credentials in MongoDB._`;
+      msg += `💡 _No emails loaded. Please upload a .csv or .txt file to store credentials in MongoDB._`;
     } else {
       msg += `Ready to run searches! Use \`/search <sender> [keyword]\``;
     }
@@ -119,15 +119,17 @@ bot.command('clear', async (ctx) => {
   }
 });
 
-// File Upload Handler (CSV)
+// File Upload Handler (CSV & TXT)
 bot.on(message('document'), async (ctx) => {
   const document = ctx.message.document;
+  const isCsv = document.file_name.endsWith('.csv');
+  const isTxt = document.file_name.endsWith('.txt');
   
-  if (!document.file_name.endsWith('.csv')) {
-    return ctx.reply('⚠️ Please upload a valid CSV (.csv) file.');
+  if (!isCsv && !isTxt) {
+    return ctx.reply('⚠️ Please upload a valid CSV (.csv) or text (.txt) file.');
   }
 
-  const processingMsg = await ctx.reply('⏳ Downloading and parsing CSV file...');
+  const processingMsg = await ctx.reply('⏳ Downloading and parsing file...');
 
   try {
     const fileLink = await ctx.telegram.getFileLink(document.file_id);
@@ -137,35 +139,66 @@ bot.on(message('document'), async (ctx) => {
       throw new Error(`Failed to download file: ${response.statusText}`);
     }
     
-    const csvText = await response.text();
-    const records = parse(csvText, {
-      columns: true,
-      skip_empty_lines: true,
-      trim: true
-    });
+    const fileText = await response.text();
+    let emailsList = [];
 
-    if (records.length === 0) {
-      throw new Error('CSV file is empty or missing headers.');
+    // 1. Try CSV Parsing (assumes headers exist)
+    try {
+      const records = parse(fileText, {
+        columns: true,
+        skip_empty_lines: true,
+        trim: true
+      });
+
+      if (records.length > 0) {
+        emailsList = records.map(row => {
+          const emailKey = Object.keys(row).find(k => k.toLowerCase() === 'email');
+          const passKey = Object.keys(row).find(k => k.toLowerCase() === 'password' || k.toLowerCase() === 'pass');
+          const hostKey = Object.keys(row).find(k => k.toLowerCase() === 'imap_host' || k.toLowerCase() === 'host' || k.toLowerCase() === 'imaphost');
+          const portKey = Object.keys(row).find(k => k.toLowerCase() === 'imap_port' || k.toLowerCase() === 'port' || k.toLowerCase() === 'imapport');
+
+          if (!emailKey || !passKey) return null;
+
+          return {
+            email: row[emailKey],
+            password: row[passKey],
+            imapHost: hostKey ? row[hostKey] : undefined,
+            imapPort: portKey ? row[portKey] : undefined
+          };
+        }).filter(Boolean);
+      }
+    } catch (err) {
+      // Ignore CSV parser errors to allow raw line-by-line fallback
     }
 
-    const emailsList = records.map(row => {
-      const emailKey = Object.keys(row).find(k => k.toLowerCase() === 'email');
-      const passKey = Object.keys(row).find(k => k.toLowerCase() === 'password' || k.toLowerCase() === 'pass');
-      const hostKey = Object.keys(row).find(k => k.toLowerCase() === 'imap_host' || k.toLowerCase() === 'host' || k.toLowerCase() === 'imaphost');
-      const portKey = Object.keys(row).find(k => k.toLowerCase() === 'imap_port' || k.toLowerCase() === 'port' || k.toLowerCase() === 'imapport');
+    // 2. Fallback Line-by-Line Parsing (if CSV parsing yielded 0 valid accounts)
+    if (emailsList.length === 0) {
+      const lines = fileText.split(/\r?\n/);
+      emailsList = lines.map(line => {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.toLowerCase().startsWith('email')) return null; // skip headers or empty lines
 
-      if (!emailKey || !passKey) return null;
+        // Split by comma, tab, pipe, or colon
+        const parts = trimmed.split(/[,\t|:]/);
+        if (parts.length < 2) return null;
 
-      return {
-        email: row[emailKey],
-        password: row[passKey],
-        imapHost: hostKey ? row[hostKey] : undefined,
-        imapPort: portKey ? row[portKey] : undefined
-      };
-    }).filter(Boolean);
+        const email = parts[0].trim();
+        const password = parts[1].trim();
+
+        // Check if first part looks like an email
+        if (!email.includes('@')) return null;
+
+        return {
+          email,
+          password,
+          imapHost: parts[2] ? parts[2].trim() : undefined,
+          imapPort: parts[3] ? parseInt(parts[3].trim(), 10) : undefined
+        };
+      }).filter(Boolean);
+    }
 
     if (emailsList.length === 0) {
-      throw new Error('Could not find both "email" and "password" columns in CSV headers.');
+      throw new Error('No valid email/password patterns found. Make sure the file format is: email,password (one per line).');
     }
 
     const savedCount = await saveEmails(emailsList);
