@@ -429,6 +429,7 @@ bot.on(message('document'), async (ctx) => {
       });
 
       if (records.length > 0) {
+        const seenEmails = new Set();
         emailsList = records.map(row => {
           const emailKey = Object.keys(row).find(k => k.toLowerCase() === 'email');
           const passKey = Object.keys(row).find(k => k.toLowerCase() === 'password' || k.toLowerCase() === 'pass');
@@ -437,9 +438,16 @@ bot.on(message('document'), async (ctx) => {
 
           if (!emailKey || !passKey) return null;
 
+          const email = row[emailKey].trim().toLowerCase();
+          const password = row[passKey].trim();
+
+          if (!email || !email.includes('@')) return null;
+          if (seenEmails.has(email)) return null; // skip duplicate
+          seenEmails.add(email);
+
           return {
-            email: row[emailKey],
-            password: row[passKey],
+            email,
+            password,
             imapHost: hostKey ? row[hostKey] : undefined,
             imapPort: portKey ? row[portKey] : undefined
           };
@@ -452,6 +460,7 @@ bot.on(message('document'), async (ctx) => {
     // 2. Fallback Line-by-Line Parsing (if CSV parsing yielded 0 valid records)
     if (emailsList.length === 0) {
       const lines = fileText.split(/\r?\n/);
+      const seenEmailsFallback = new Set();
       emailsList = lines.map(line => {
         const trimmed = line.trim();
         if (!trimmed || trimmed.toLowerCase().startsWith('email')) return null; // skip headers or empty lines
@@ -460,11 +469,13 @@ bot.on(message('document'), async (ctx) => {
         const parts = trimmed.split(/[,\t|:]/);
         if (parts.length < 2) return null;
 
-        const email = parts[0].trim();
+        const email = parts[0].trim().toLowerCase();
         const password = parts[1].trim();
 
         // Check if first part looks like an email
         if (!email.includes('@')) return null;
+        if (seenEmailsFallback.has(email)) return null; // skip duplicate
+        seenEmailsFallback.add(email);
 
         return {
           email,
